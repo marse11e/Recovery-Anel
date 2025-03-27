@@ -21,7 +21,6 @@ except ImportError:
 # ======================================================
 # Функция для обнаружения доступных дисков
 # ======================================================
-
 def get_available_disks():
     disks = []
     if sys.platform == "win32":
@@ -43,7 +42,6 @@ def get_available_disks():
 # ======================================================
 # Функция определения типа файловой системы
 # ======================================================
-
 def determine_fs_type(device_path):
     """
     Чтение первых секторов для определения сигнатуры ФС:
@@ -71,7 +69,6 @@ def determine_fs_type(device_path):
 # ======================================================
 # BACKEND: Реальное восстановление удалённых файлов
 # ======================================================
-
 class FileRecoveryEngine(QtCore.QObject):
     progressChanged = QtCore.pyqtSignal(int)
     logMessage = QtCore.pyqtSignal(str)
@@ -98,195 +95,175 @@ class FileRecoveryEngine(QtCore.QObject):
         return fs
 
     # ------------------------------------------------------------------
-    # Сканирование NTFS: Чтение MFT через pytsk3
+    # Рекурсивное сканирование с использованием pytsk3 для ФС,
+    # если библиотека установлена и ФС поддерживается.
     # ------------------------------------------------------------------
-    def scan_ntfs(self, device_path):
-        self.logMessage.emit("Сканирование NTFS через чтение MFT...")
+    def recursive_scan(self, fs, directory, results):
+        for entry in directory:
+            # Пропускаем специальные записи
+            if entry.info.name.name in [b".", b".."]:
+                continue
+            try:
+                name = entry.info.name.name.decode("utf-8")
+            except Exception:
+                name = str(entry.info.name.name)
+            if entry.info.meta is None:
+                continue
+
+            # Если файл отмечен как удалённый, добавляем его в результаты
+            if entry.info.meta.flags & pytsk3.TSK_FS_META_FLAG_UNALLOC:
+                file_item = {
+                    'name': name,
+                    'type': 'Unknown',
+                    'size': entry.info.meta.size,
+                    'status': 'Deleted',
+                    'deleted_date': 'N/A',
+                    'mft_addr': entry.info.meta.addr
+                }
+                results.append(file_item)
+                self.logMessage.emit(f"Найден удалённый файл: {name}")
+
+            # Если это каталог, обходим его рекурсивно
+            if entry.info.meta.type == pytsk3.TSK_FS_META_TYPE_DIR:
+                try:
+                    sub_directory = entry.as_directory()
+                    self.recursive_scan(fs, sub_directory, results)
+                except Exception as e:
+                    self.logMessage.emit(f"Ошибка при обходе каталога {name}: {e}")
+
+    def scan_with_pytsk3(self, device_path):
+        self.logMessage.emit("Сканирование с использованием pytsk3...")
         results = []
         try:
             img = pytsk3.Img_Info(device_path)
             fs = pytsk3.FS_Info(img)
-            directory = fs.open_dir(path="/")
-            total = 0
-            for entry in directory:
-                total += 1
-                if not entry.info.name.name or entry.info.meta is None:
-                    continue
-                try:
-                    name = entry.info.name.name.decode("utf-8")
-                except Exception:
-                    name = str(entry.info.name.name)
-                if entry.info.meta.flags & pytsk3.TSK_FS_META_FLAG_UNALLOC:
-                    file_item = {
-                        'name': name,
-                        'type': 'Unknown',
-                        'size': entry.info.meta.size,
-                        'status': 'Deleted',
-                        'deleted_date': 'N/A',
-                        'mft_addr': entry.info.meta.addr
-                    }
-                    results.append(file_item)
-                    self.logMessage.emit(f"Найден удалённый файл: {name}")
-                self.progressChanged.emit(int(100 * total / 1000))
-            self.logMessage.emit("Сканирование NTFS завершено.")
+            root_dir = fs.open_dir(path="/")
+            self.recursive_scan(fs, root_dir, results)
         except Exception as e:
-            self.logMessage.emit(f"Ошибка сканирования NTFS: {str(e)}")
+            self.logMessage.emit(f"Ошибка сканирования: {e}")
         return results
 
     # ------------------------------------------------------------------
-    # Сканирование FAT32: Анализ FAT (упрощённо)
-    # ------------------------------------------------------------------
-    def scan_fat32(self, device_path):
-        self.logMessage.emit("Сканирование FAT32 (упрощённо)...")
-        results = []
-        try:
-            fake_file = {
-                'name': "deleted_photo.jpg",
-                'type': 'Image',
-                'size': 204800,
-                'status': 'Deleted',
-                'deleted_date': "2025-03-20",
-                'data_offset': 123456
-            }
-            results.append(fake_file)
-            self.logMessage.emit("Найден удалённый файл (FAT32): deleted_photo.jpg")
-        except Exception as e:
-            self.logMessage.emit(f"Ошибка сканирования FAT32: {str(e)}")
-        return results
-
-    # ------------------------------------------------------------------
-    # Сканирование ext4: Анализ суперблока и inodes (упрощённо)
-    # ------------------------------------------------------------------
-    def scan_ext4(self, device_path):
-        self.logMessage.emit("Сканирование ext4 (упрощённо)...")
-        results = []
-        try:
-            fake_file = {
-                'name': "deleted_document.pdf",
-                'type': 'Document',
-                'size': 102400,
-                'status': 'Deleted',
-                'deleted_date': "2025-03-18",
-                'inode': 12345
-            }
-            results.append(fake_file)
-            self.logMessage.emit("Найден удалённый файл (ext4): deleted_document.pdf")
-        except Exception as e:
-            self.logMessage.emit(f"Ошибка сканирования ext4: {str(e)}")
-        return results
-
-    # ------------------------------------------------------------------
-    # Поиск файлов по сигнатурам (начало и конец файла)
+    # Сканирование устройства путём поиска сигнатур файлов по бинарному содержимому.
+    # Реализован пример для JPEG-файлов.
     # ------------------------------------------------------------------
     def scan_by_signature(self, device_path):
-        self.logMessage.emit("Поиск файлов по сигнатурам (начало и конец)...")
+        self.logMessage.emit("Поиск файлов по сигнатурам по всему устройству...")
         results = []
         start_sig = b'\xff\xd8'
         end_sig = b'\xff\xd9'
+        block_size = 1024 * 1024  # Чтение блоками по 1 МБ
+        overlap = 1024           # Перекрытие для поиска сигнатур на границах блоков
+        offset = 0
+        buffer = b""
         try:
             with open(device_path, 'rb') as f:
-                data = f.read(10 * 1024 * 1024)
-                for match in re.finditer(start_sig, data):
-                    start_pos = match.start()
-                    end_match = re.search(end_sig, data[start_pos:])
-                    if end_match:
-                        end_pos = start_pos + end_match.end()
-                        file_size = end_pos - start_pos
-                        status = 'Deleted'
-                    else:
-                        end_pos = len(data)
-                        file_size = end_pos - start_pos
-                        status = 'Partial'
-                    auto_name = f"recovered_jpeg_{start_pos}_{random.randint(1000,9999)}.jpg"
-                    file_item = {
-                        'name': auto_name,
-                        'type': 'Image',
-                        'size': file_size,
-                        'status': status,
-                        'deleted_date': 'N/A',
-                        'data_offset': start_pos,
-                        'data_end': end_pos
-                    }
-                    results.append(file_item)
-                    self.logMessage.emit(f"Найден JPEG файл: {auto_name} (от {start_pos} до {end_pos})")
-            if not results:
-                self.logMessage.emit("Сигнатуры файлов не найдены в данном диапазоне.")
+                while True:
+                    data = f.read(block_size)
+                    if not data:
+                        break
+                    buffer += data
+                    pos = 0
+                    while True:
+                        start_index = buffer.find(start_sig, pos)
+                        if start_index == -1:
+                            break
+                        end_index = buffer.find(end_sig, start_index)
+                        if end_index == -1:
+                            # Если конец не найден, возможно, он лежит в следующем блоке
+                            break
+                        end_index += len(end_sig)
+                        file_size = end_index - start_index
+                        auto_name = f"recovered_jpeg_{offset+start_index}_{random.randint(1000,9999)}.jpg"
+                        file_item = {
+                            'name': auto_name,
+                            'type': 'Image',
+                            'size': file_size,
+                            'status': 'Deleted',
+                            'deleted_date': 'N/A',
+                            'data_offset': offset + start_index,
+                            'data_end': offset + end_index
+                        }
+                        results.append(file_item)
+                        self.logMessage.emit(f"Найден JPEG файл: {auto_name} (от {offset+start_index} до {offset+end_index})")
+                        pos = end_index
+                    # Сохраняем последние 'overlap' байт, чтобы не потерять сигнатуры на границе блока
+                    if len(buffer) > overlap:
+                        buffer = buffer[-overlap:]
+                    offset += block_size
         except Exception as e:
-            self.logMessage.emit(f"Ошибка при поиске сигнатур: {str(e)}")
+            self.logMessage.emit(f"Ошибка при поиске сигнатур: {e}")
         return results
 
     # ------------------------------------------------------------------
-    # Функция сканирования, выбирающая метод в зависимости от типа ФС
+    # Функция сканирования, выбирающая метод в зависимости от наличия pytsk3
+    # и типа файловой системы. Если pytsk3 недоступен или ФС не поддерживается,
+    # используется поиск по сигнатурам.
     # ------------------------------------------------------------------
     def scan_disk(self, device_path):
         self.logMessage.emit(f"Начало сканирования диска: {device_path}")
         fs_type = self.determine_filesystem(device_path)
         results = []
         try:
-            if fs_type == "NTFS" and pytsk3 is not None:
-                results = self.scan_ntfs(device_path)
-            elif fs_type == "FAT32":
-                results = self.scan_fat32(device_path)
-            elif fs_type == "ext4":
-                results = self.scan_ext4(device_path)
+            if pytsk3 is not None and fs_type in ["NTFS", "FAT32", "ext4"]:
+                # При наличии pytsk3 можно попытаться сначала просканировать структурированно
+                results = self.scan_with_pytsk3(device_path)
+                if not results:
+                    self.logMessage.emit("Структурированное сканирование не дало результатов. Переход к поиску по сигнатурам...")
+                    results = self.scan_by_signature(device_path)
             else:
-                self.logMessage.emit("Неизвестная или неподдерживаемая ФС. Выполняется поиск по сигнатурам...")
                 results = self.scan_by_signature(device_path)
         except Exception as e:
-            self.logMessage.emit(f"Ошибка при сканировании диска: {str(e)}")
+            self.logMessage.emit(f"Ошибка при сканировании диска: {e}")
         self.logMessage.emit("Сканирование диска завершено.")
         self.scanFinished.emit(results)
 
     # ------------------------------------------------------------------
-    # Функция восстановления файлов
+    # Функция восстановления файлов.
+    # Если файл найден по сигнатуре, производится чтение указанного диапазона.
     # ------------------------------------------------------------------
     def recover_files(self, files, output_dir, device_path):
         self.logMessage.emit("Начало восстановления файлов...")
         try:
-            if pytsk3 is None:
-                self.logMessage.emit("pytsk3 не установлен. Невозможно выполнить восстановление.")
-                self.recoveryFinished.emit()
-                return
-            img = pytsk3.Img_Info(device_path)
-            fs = pytsk3.FS_Info(img)
-            for file in files:
-                if 'mft_addr' in file and file['mft_addr']:
-                    try:
-                        file_entry = fs.open_meta(file['mft_addr'])
-                        size = file_entry.info.meta.size
-                        data = file_entry.read_random(0, size)
-                        out_path = os.path.join(output_dir, file['name'])
-                        with open(out_path, 'wb') as f:
-                            f.write(data)
-                        self.logMessage.emit(f"Файл восстановлен: {out_path} ({size} байт)")
-                    except Exception as e:
-                        self.logMessage.emit(f"Ошибка при восстановлении файла {file['name']}: {str(e)}")
-                elif 'data_offset' in file:
-                    try:
-                        with open(device_path, 'rb') as f:
-                            f.seek(file['data_offset'])
+            with open(device_path, 'rb') as disk:
+                for file in files:
+                    if 'data_offset' in file:
+                        try:
+                            disk.seek(file['data_offset'])
                             if 'data_end' in file:
                                 size = file['data_end'] - file['data_offset']
                             else:
                                 size = file.get('size', 102400)
-                            data = f.read(size)
-                        out_path = os.path.join(output_dir, file['name'])
-                        with open(out_path, 'wb') as out_file:
-                            out_file.write(data)
-                        self.logMessage.emit(f"Файл восстановлен по сигнатуре: {out_path}")
-                    except Exception as e:
-                        self.logMessage.emit(f"Ошибка при восстановлении файла {file['name']}: {str(e)}")
-                else:
-                    self.logMessage.emit(f"Нет достаточной информации для восстановления файла {file['name']}")
+                            data = disk.read(size)
+                            out_path = os.path.join(output_dir, file['name'])
+                            with open(out_path, 'wb') as out_file:
+                                out_file.write(data)
+                            self.logMessage.emit(f"Файл восстановлен по сигнатуре: {out_path} ({size} байт)")
+                        except Exception as e:
+                            self.logMessage.emit(f"Ошибка при восстановлении файла {file['name']}: {e}")
+                    elif 'mft_addr' in file and file['mft_addr']:
+                        try:
+                            img = pytsk3.Img_Info(device_path)
+                            fs = pytsk3.FS_Info(img)
+                            file_entry = fs.open_meta(file['mft_addr'])
+                            size = file_entry.info.meta.size
+                            data = file_entry.read_random(0, size)
+                            out_path = os.path.join(output_dir, file['name'])
+                            with open(out_path, 'wb') as f:
+                                f.write(data)
+                            self.logMessage.emit(f"Файл восстановлен: {out_path} ({size} байт)")
+                        except Exception as e:
+                            self.logMessage.emit(f"Ошибка при восстановлении файла {file['name']}: {e}")
+                    else:
+                        self.logMessage.emit(f"Нет достаточной информации для восстановления файла {file['name']}")
             self.logMessage.emit("Восстановление файлов завершено.")
         except Exception as e:
-            self.logMessage.emit(f"Ошибка восстановления: {str(e)}")
+            self.logMessage.emit(f"Ошибка восстановления: {e}")
         self.recoveryFinished.emit()
 
 # ======================================================
 # GUI: PyQt5 Интерфейс
 # ======================================================
-
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
