@@ -165,7 +165,7 @@ class FileRecoveryEngine(QtCore.QObject):
                     'type': data_type,
                     'size': entry.info.meta.size,
                     'status': 'Deleted',
-                    'deleted_date': accessed_time.strftime('%Y-%m-%d'),
+                    'deleted_date': accessed_time.strftime('%Y-%m-%d %H:%M:%S'),
                     'mft_addr': entry.info.meta.addr,
                     'path': full_path
                 }
