@@ -301,6 +301,9 @@ class FileRecoveryEngine(QtCore.QObject):
                             fs = pytsk3.FS_Info(img)
                             file_entry = fs.open_meta(file['mft_addr'])
                             size = file_entry.info.meta.size
+                            if size <= 0:
+                                self.logMessage.emit(f"Пропуск файла {file['name']}: недопустимый размер.")
+                                continue
                             data = file_entry.read_random(0, size)
                             out_path = os.path.join(output_dir, file['path'].lstrip('/'))
                             os.makedirs(os.path.dirname(out_path), exist_ok=True)
