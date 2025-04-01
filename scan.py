@@ -10,7 +10,6 @@ import platform
 import struct
 from datetime import datetime, timedelta
 import multiprocessing
-from multiprocessing import Manager
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -31,30 +30,15 @@ SIGNATURES = [
     {'ext': 'xlsx', 'start': b'PK\x03\x04', 'end': b'PK\x05\x06'},
     {'ext': 'mp4', 'start': b'\x00\x00\x00\x18ftyp', 'end': None},
     {'ext': 'zip', 'start': b'PK\x03\x04', 'end': b'PK\x05\x06'},
-    {'ext': 'bmp', 'start': b'BM', 'end': None},
+    {'ext': 'txt', 'start': b'', 'end': None},
+    {'ext': 'doc', 'start': b'\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1', 'end': None},
+    {'ext': 'mp3', 'start': b'ID3', 'end': None},
     {'ext': 'avi', 'start': b'RIFF', 'end': None},
     {'ext': 'wav', 'start': b'RIFF', 'end': None},
     {'ext': 'exe', 'start': b'MZ', 'end': None},
+    {'ext': 'bmp', 'start': b'BM', 'end': None},
 ]
 
-CATEGORY_MAP = {
-    'jpg': 'Image',
-    'png': 'Image',
-    'gif': 'Image',
-    'bmp': 'Image',
-    'pdf': 'Document',
-    'docx': 'Document',
-    'xlsx': 'Document',
-    'txt': 'Text',
-    'mp4': 'Video',
-    'avi': 'Video',
-    'wav': 'Audio',
-    'zip': 'Archive',
-    'exe': 'Executable',
-    'folder': 'Directory',
-}
-
-# Функция для обнаружения доступных дисков
 def get_available_disks():
     disks = []
     if sys.platform == "win32":
@@ -73,7 +57,6 @@ def get_available_disks():
                     disks.append(os.path.join(dev_dir, device))
     return disks
 
-# Функция определения типа файловой системы
 def determine_fs_type(device_path):
     try:
         with open(device_path, 'rb') as f:
@@ -92,9 +75,8 @@ def determine_fs_type(device_path):
         print(f"Ошибка определения ФС: {e}")
     return "Unknown"
 
-# Функция для сканирования сегмента диска по сигнатурам
 def scan_segment(args):
-    device_path, offset, length, overlap, stop_event, signatures, log_queue = args
+    device_path, offset, length, overlap, stop_event, pause_event, signatures = args
     if stop_event.is_set():
         return []
     results = []
@@ -103,6 +85,10 @@ def scan_segment(args):
             f.seek(offset)
             buffer = f.read(length + overlap)
         for sig in signatures:
+            if stop_event.is_set():
+                break
+            while pause_event.is_set():
+                time.sleep(0.1)
             start_sig = sig['start']
             end_sig = sig['end']
             pos = 0
@@ -116,38 +102,35 @@ def scan_segment(args):
                         break
                     end_index += len(end_sig)
                 else:
-                    end_index = start_index + 1024 * 1024  # Фиксированный размер для файлов без конца
+                    end_index = start_index + 1024 * 1024
                 file_size = end_index - start_index
                 auto_name = f"recovered_{sig['ext']}_{offset+start_index}_{random.randint(1000,9999)}.{sig['ext']}"
                 file_item = {
                     'name': auto_name,
                     'type': sig['ext'].upper(),
-                    'extension': sig['ext'].lower(),
-                    'category': CATEGORY_MAP.get(sig['ext'], 'Other'),
                     'size': file_size,
                     'status': 'Deleted',
-                    'deletedړعولداته': 'N/A',
+                    'deleted_date': 'N/A',
                     'data_offset': offset + start_index,
-                    'data_end': offset + end_index
+                    'data_end': offset + end_index,
+                    'recovery_status': 'Fully' if file_size > 0 else 'Impossible'
                 }
                 results.append(file_item)
-                log_queue.put(f"Найден файл: {auto_name}")
                 pos = end_index
-    except Exception as e:
-        log_queue.put(f"Ошибка в scan_segment: {e}")
+    except Exception:
+        pass
     return results
 
-# Класс для восстановления файлов
 class FileRecoveryEngine(QtCore.QObject):
     progressChanged = QtCore.pyqtSignal(int)
     logMessage = QtCore.pyqtSignal(str)
     scanFinished = QtCore.pyqtSignal(list)
     recoveryFinished = QtCore.pyqtSignal()
-    progressModeChanged = QtCore.pyqtSignal(str)  # 'indeterminate' or 'determinate'
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.stop_event = multiprocessing.Event()
+        self.pause_event = multiprocessing.Event()
 
     def open_disk_direct(self, device_path):
         try:
@@ -168,6 +151,8 @@ class FileRecoveryEngine(QtCore.QObject):
         for entry in directory:
             if self.stop_event.is_set():
                 return
+            while self.pause_event.is_set():
+                time.sleep(0.1)
             if entry.info.name.name in [b".", b".."]:
                 continue
             try:
@@ -182,22 +167,19 @@ class FileRecoveryEngine(QtCore.QObject):
                 filename = entry.info.name.name.decode()
                 _, file_extension = os.path.splitext(filename)
                 if entry.info.name.type == pytsk3.TSK_FS_NAME_TYPE_REG:
-                    extension = file_extension.lstrip('.').lower()
-                    category = CATEGORY_MAP.get(extension, 'Other')
+                    data_type = file_extension.lstrip('.').upper()
                 elif entry.info.name.type == pytsk3.TSK_FS_NAME_TYPE_DIR:
-                    extension = 'folder'
-                    category = 'Directory'
+                    data_type = "Folder"
                 accessed_time = datetime.fromtimestamp(entry.info.meta.mtime) + timedelta(hours=5)
                 file_item = {
                     'name': name,
-                    'type': data_type if data_type else extension,
-                    'extension': extension,
-                    'category': category,
+                    'type': data_type,
                     'size': entry.info.meta.size,
                     'status': 'Deleted',
                     'deleted_date': accessed_time.strftime('%Y-%m-%d %H:%M:%S'),
                     'mft_addr': entry.info.meta.addr,
-                    'path': full_path
+                    'path': full_path,
+                    'recovery_status': 'Fully' if entry.info.meta.size > 0 else 'Impossible'
                 }
                 results.append(file_item)
                 self.logMessage.emit(f"Найден удалённый файл/папка: {full_path}")
@@ -220,7 +202,7 @@ class FileRecoveryEngine(QtCore.QObject):
             self.logMessage.emit(f"Ошибка сканирования: {e}")
         return results
 
-    def scan_by_signature(self, device_path):
+    def scan_by_signature(self, device_path, total_size):
         self.logMessage.emit("Поиск файлов по сигнатурам...")
         results = []
         block_size = 1024 * 1024  # 1 МБ
@@ -228,43 +210,26 @@ class FileRecoveryEngine(QtCore.QObject):
         file_size = os.path.getsize(device_path)
         if file_size > LARGE_DISK_THRESHOLD:
             self.logMessage.emit("Большой диск – параллельное сканирование...")
-            manager = Manager()
-            log_queue = manager.Queue()
             pool = multiprocessing.Pool()
             segments = []
             seg_size = block_size * 10
             for offset in range(0, file_size, seg_size):
                 length = seg_size if offset + seg_size < file_size else file_size - offset
-                segments.append((device_path, offset, length, overlap, self.stop_event, SIGNATURES, log_queue))
-            total_segments = len(segments)
-            processed = 0
-
-            def callback(res):
-                nonlocal processed
-                results.extend(res)
-                processed += 1
-                progress = (processed / total_segments) * 100
-                self.progressChanged.emit(int(progress))
-
-            for seg in segments:
-                pool.apply_async(scan_segment, args=(seg,), callback=callback)
-
+                segments.append((device_path, offset, length, overlap, self.stop_event, self.pause_event, SIGNATURES))
+                self.progressChanged.emit(int((offset / file_size) * 100))
+            pool_results = pool.map(scan_segment, segments)
             pool.close()
-            while processed < total_segments and not self.stop_event.is_set():
-                try:
-                    while not log_queue.empty():
-                        message = log_queue.get_nowait()
-                        self.logMessage.emit(message)
-                except queue.Empty:
-                    pass
-                time.sleep(0.1)
             pool.join()
+            for seg in pool_results:
+                results.extend(seg)
         else:
             try:
                 with open(device_path, 'rb') as f:
                     offset = 0
                     buffer = b""
                     while not self.stop_event.is_set():
+                        while self.pause_event.is_set():
+                            time.sleep(0.1)
                         data = f.read(block_size)
                         if not data:
                             break
@@ -289,13 +254,12 @@ class FileRecoveryEngine(QtCore.QObject):
                                 file_item = {
                                     'name': auto_name,
                                     'type': sig['ext'].upper(),
-                                    'extension': sig['ext'].lower(),
-                                    'category': CATEGORY_MAP.get(sig['ext'], 'Other'),
                                     'size': file_size_found,
                                     'status': 'Deleted',
                                     'deleted_date': 'N/A',
                                     'data_offset': offset + start_index,
-                                    'data_end': offset + end_index
+                                    'data_end': offset + end_index,
+                                    'recovery_status': 'Fully' if file_size_found > 0 else 'Impossible'
                                 }
                                 results.append(file_item)
                                 self.logMessage.emit(f"Найден файл: {auto_name}")
@@ -303,29 +267,30 @@ class FileRecoveryEngine(QtCore.QObject):
                         if len(buffer) > overlap:
                             buffer = buffer[-overlap:]
                         offset += block_size
-                        progress = (offset / file_size) * 100
-                        self.progressChanged.emit(int(progress))
+                        self.progressChanged.emit(int((offset / file_size) * 100))
             except Exception as e:
                 self.logMessage.emit(f"Ошибка при поиске сигнатур: {e}")
         self.logMessage.emit("Сканирование по сигнатурам завершено.")
         return results
 
-    def scan_disk(self, device_path):
+    def scan_disk(self, device_path, deep_scan=False):
         self.stop_event.clear()
+        self.pause_event.clear()
         self.logMessage.emit(f"Начало сканирования диска: {device_path}")
         fs_type = self.determine_filesystem(device_path)
         results = []
+        total_size = os.path.getsize(device_path)
         try:
-            if pytsk3 is not None and fs_type in ["NTFS", "FAT32", "ext4"]:
+            if not deep_scan and pytsk3 is not None and fs_type in ["NTFS", "FAT32", "ext4"]:
                 results = self.scan_with_pytsk3(device_path)
-                if not results:
-                    self.logMessage.emit("Структурированное сканирование не дало результатов. Переход к сигнатурам...")
-                    results = self.scan_by_signature(device_path)
             else:
-                results = self.scan_by_signature(device_path)
+                results = self.scan_by_signature(device_path, total_size)
+                if pytsk3 and fs_type in ["NTFS", "FAT32", "ext4"]:
+                    results.extend(self.scan_with_pytsk3(device_path))
         except Exception as e:
             self.logMessage.emit(f"Ошибка при сканировании: {e}")
         self.logMessage.emit("Сканирование завершено.")
+        self.progressChanged.emit(100)
         self.scanFinished.emit(results)
 
     def recover_files(self, files, output_dir, device_path):
@@ -367,7 +332,7 @@ class FileRecoveryEngine(QtCore.QObject):
                             self.logMessage.emit(f"Файл восстановлен: {out_path} ({size} байт)")
                         except Exception as e:
                             self.logMessage.emit(f"Ошибка восстановления {file['name']}: {e}")
-                    elif file.get('type') == "Folder.":
+                    elif file.get('type') == "Folder":
                         try:
                             out_path = os.path.join(output_dir, file['path'].lstrip('/'))
                             os.makedirs(out_path, exist_ok=True)
@@ -380,7 +345,6 @@ class FileRecoveryEngine(QtCore.QObject):
             self.logMessage.emit(f"Ошибка восстановления: {e}")
         self.recoveryFinished.emit()
 
-# GUI
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -388,6 +352,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resize(1000, 600)
         self.engine = FileRecoveryEngine()
         self.current_device = None
+        self.all_files = []
         self.setup_ui()
         self.setup_connections()
 
@@ -401,49 +366,60 @@ class MainWindow(QtWidgets.QMainWindow):
         if not disks:
             disks = ["Нет дисков"]
         self.deviceCombo.addItems(disks)
+        self.scanTypeCombo = QtWidgets.QComboBox()
+        self.scanTypeCombo.addItems(["Быстрое (метаданные)", "Глубокое (сигнатуры + метаданные)"])
         self.scanButton = QtWidgets.QPushButton("Сканировать диск")
         self.stopButton = QtWidgets.QPushButton("Остановить")
+        self.pauseButton = QtWidgets.QPushButton("Пауза")
+        self.searchEdit = QtWidgets.QLineEdit()
+        self.searchEdit.setPlaceholderText("Поиск по имени или пути...")
         topPanel.addWidget(QtWidgets.QLabel("Устройство:"))
         topPanel.addWidget(self.deviceCombo)
+        topPanel.addWidget(QtWidgets.QLabel("Тип сканирования:"))
+        topPanel.addWidget(self.scanTypeCombo)
         topPanel.addWidget(self.scanButton)
         topPanel.addWidget(self.stopButton)
+        topPanel.addWidget(self.pauseButton)
+        topPanel.addWidget(self.searchEdit)
         topPanel.addStretch()
 
-        self.fileTable = QtWidgets.QTableWidget(0, 5)
-        self.fileTable.setHorizontalHeaderLabels(["Имя", "Тип", "Размер", "Статус", "Дата удаления"])
-        self.fileTable.horizontalHeader().setStretchLastSection(True)
-        self.fileTable.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.fileTable.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        tabWidget = QtWidgets.QTabWidget()
+        mainTab = QtWidgets.QWidget()
+        mainTabLayout = QtWidgets.QVBoxLayout()
 
-        filterGroup = QtWidgets.QGroupBox("Фильтры")
+        filterGroup = QtWidgets.QGroupBox("Фильтры и сортировка")
         filterLayout = QtWidgets.QHBoxLayout()
         self.filterType = QtWidgets.QComboBox()
         self.filterType.addItem("Все типы")
-        self.filterType.addItems(["Image", "Document", "Video", "Archive", "Folder."])
+        self.filterType.addItems(["JPG", "PNG", "GIF", "PDF", "DOCX", "XLSX", "MP4", "ZIP", "TXT", "DOC", "MP3", "AVI", "WAV", "EXE", "BMP", "Folder"])
         self.filterSize = QtWidgets.QLineEdit()
         self.filterSize.setPlaceholderText("Размер (байт)")
         self.filterStatus = QtWidgets.QComboBox()
         self.filterStatus.addItem("Все статусы")
         self.filterStatus.addItem("Deleted")
-        self.filterDateFrom = QtWidgets.QDateEdit()
-        self.filterDateFrom.setCalendarPopup(True)
-        self.filterDateFrom.setDisplayFormat("yyyy-MM-dd")
-        self.filterDateFrom.setDate(QtCore.QDate.currentDate().addDays(-30))
-        self.filterDateTo = QtWidgets.QDateEdit()
-        self.filterDateTo.setCalendarPopup(True)
-        self.filterDateTo.setDisplayFormat("yyyy-MM-dd")
-        self.filterDateTo.setDate(QtCore.QDate.currentDate())
+        self.sortNameButton = QtWidgets.QPushButton("Сортировать по имени")
+        self.sortSizeButton = QtWidgets.QPushButton("Сортировать по размеру")
+        self.sortDateButton = QtWidgets.QPushButton("Сортировать по дате")
         filterLayout.addWidget(QtWidgets.QLabel("Тип:"))
         filterLayout.addWidget(self.filterType)
         filterLayout.addWidget(QtWidgets.QLabel("Размер:"))
         filterLayout.addWidget(self.filterSize)
         filterLayout.addWidget(QtWidgets.QLabel("Статус:"))
         filterLayout.addWidget(self.filterStatus)
-        filterLayout.addWidget(QtWidgets.QLabel("Дата от:"))
-        filterLayout.addWidget(self.filterDateFrom)
-        filterLayout.addWidget(QtWidgets.QLabel("до:"))
-        filterLayout.addWidget(self.filterDateTo)
+        filterLayout.addWidget(self.sortNameButton)
+        filterLayout.addWidget(self.sortSizeButton)
+        filterLayout.addWidget(self.sortDateButton)
         filterGroup.setLayout(filterLayout)
+
+        self.fileTable = QtWidgets.QTableWidget(0, 6)
+        self.fileTable.setHorizontalHeaderLabels(["Имя", "Тип", "Размер", "Статус", "Дата удаления", "Статус восстановления"])
+        self.fileTable.horizontalHeader().setStretchLastSection(True)
+        self.fileTable.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.fileTable.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+
+        self.treeWidget = QtWidgets.QTreeWidget()
+        self.treeWidget.setHeaderLabels(["Путь", "Тип", "Размер"])
+        self.treeWidget.setColumnWidth(0, 400)
 
         previewGroup = QtWidgets.QGroupBox("Предпросмотр")
         previewLayout = QtWidgets.QVBoxLayout()
@@ -467,9 +443,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.logText = QtWidgets.QTextEdit()
         self.logText.setReadOnly(True)
-        tabWidget = QtWidgets.QTabWidget()
-        mainTab = QtWidgets.QWidget()
-        mainTabLayout = QtWidgets.QVBoxLayout()
+
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         leftWidget = QtWidgets.QWidget()
         leftLayout = QtWidgets.QVBoxLayout()
@@ -484,7 +458,9 @@ class MainWindow(QtWidgets.QMainWindow):
         mainTabLayout.addWidget(self.progressBar)
         mainTabLayout.addLayout(controlPanel)
         mainTab.setLayout(mainTabLayout)
-        tabWidget.addTab(mainTab, "Интерфейс")
+
+        tabWidget.addTab(mainTab, "Таблица")
+        tabWidget.addTab(self.treeWidget, "Дерево")
         tabWidget.addTab(self.logText, "Логи")
 
         mainLayout.addWidget(tabWidget)
@@ -504,11 +480,13 @@ class MainWindow(QtWidgets.QMainWindow):
             QProgressBar { background-color: #3c3c3c; border: 1px solid #3c3c3c; text-align: center; color: #d4d4d4; }
             QProgressBar::chunk { background-color: #007acc; }
             QTextEdit { background-color: #1e1e1e; }
+            QTreeWidget { background-color: #252526; border: 1px solid #3c3c3c; color: #d4d4d4; }
         """)
 
     def setup_connections(self):
         self.scanButton.clicked.connect(self.start_scan)
         self.stopButton.clicked.connect(self.stop_scan)
+        self.pauseButton.clicked.connect(self.toggle_pause)
         self.rescanButton.clicked.connect(self.start_scan)
         self.recoverButton.clicked.connect(self.recover_selected_files)
         self.engine.progressChanged.connect(self.progressBar.setValue)
@@ -519,8 +497,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.filterType.currentIndexChanged.connect(self.filter_table)
         self.filterStatus.currentIndexChanged.connect(self.filter_table)
         self.filterSize.textChanged.connect(self.filter_table)
-        self.filterDateFrom.dateChanged.connect(self.filter_table)
-        self.filterDateTo.dateChanged.connect(self.filter_table)
+        self.searchEdit.textChanged.connect(self.filter_table)
+        self.sortNameButton.clicked.connect(lambda: self.sort_table(0))
+        self.sortSizeButton.clicked.connect(lambda: self.sort_table(2))
+        self.sortDateButton.clicked.connect(lambda: self.sort_table(4))
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -536,31 +516,43 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def start_scan(self):
         self.fileTable.setRowCount(0)
+        self.treeWidget.clear()
         self.progressBar.setValue(0)
         device = self.deviceCombo.currentText()
         self.current_device = device
-        self.append_log(f"Сканирование устройства: {device}")
+        deep_scan = self.scanTypeCombo.currentText() == "Глубокое (сигнатуры + метаданные)"
+        self.append_log(f"Сканирование устройства: {device} ({'глубокое' if deep_scan else 'быстрое'})")
         if not self.engine.open_disk_direct(device):
             self.append_log("Ошибка доступа!")
             return
-        self.scanThread = threading.Thread(target=self.engine.scan_disk, args=(device,))
+        self.scanThread = threading.Thread(target=self.engine.scan_disk, args=(device, deep_scan))
         self.scanThread.start()
 
     def stop_scan(self):
         self.engine.stop_event.set()
         self.append_log("Остановка сканирования.")
 
+    def toggle_pause(self):
+        if self.engine.pause_event.is_set():
+            self.engine.pause_event.clear()
+            self.pauseButton.setText("Пауза")
+            self.append_log("Сканирование возобновлено.")
+        else:
+            self.engine.pause_event.set()
+            self.pauseButton.setText("Возобновить")
+            self.append_log("Сканирование приостановлено.")
+
     def update_file_table(self, files):
         self.all_files = files
         self.filter_table()
+        self.update_tree()
 
     def filter_table(self):
         self.fileTable.setRowCount(0)
         type_filter = self.filterType.currentText()
         status_filter = self.filterStatus.currentText()
         size_filter = self.filterSize.text().strip()
-        date_from = self.filterDateFrom.date().toPyDate()
-        date_to = self.filterDateTo.date().toPyDate()
+        search_text = self.searchEdit.text().strip().lower()
         for file in self.all_files:
             if type_filter != "Все типы" and file['type'] != type_filter:
                 continue
@@ -572,12 +564,8 @@ class MainWindow(QtWidgets.QMainWindow):
                         continue
                 except ValueError:
                     pass
-            try:
-                file_date = datetime.strptime(file['deleted_date'], "%Y-%m-%d").date()
-                if file_date < date_from or file_date > date_to:
-                    continue
-            except Exception:
-                pass
+            if search_text and search_text not in file['name'].lower() and ('path' not in file or search_text not in file['path'].lower()):
+                continue
             row = self.fileTable.rowCount()
             self.fileTable.insertRow(row)
             self.fileTable.setItem(row, 0, QtWidgets.QTableWidgetItem(file['name']))
@@ -585,6 +573,32 @@ class MainWindow(QtWidgets.QMainWindow):
             self.fileTable.setItem(row, 2, QtWidgets.QTableWidgetItem(str(file['size'])))
             self.fileTable.setItem(row, 3, QtWidgets.QTableWidgetItem(file['status']))
             self.fileTable.setItem(row, 4, QtWidgets.QTableWidgetItem(file['deleted_date']))
+            self.fileTable.setItem(row, 5, QtWidgets.QTableWidgetItem(file['recovery_status']))
+
+    def update_tree(self):
+        self.treeWidget.clear()
+        tree_dict = {}
+        for file in self.all_files:
+            path = file.get('path', file['name'])
+            parts = path.strip('/').split('/')
+            current = tree_dict
+            for part in parts[:-1]:
+                if part not in current:
+                    current[part] = {}
+                current = current[part]
+            current[parts[-1]] = file
+        def add_items(parent, items):
+            for name, item in items.items():
+                if isinstance(item, dict) and 'size' not in item:
+                    tree_item = QtWidgets.QTreeWidgetItem(parent, [name, "Folder", ""])
+                    add_items(tree_item, item)
+                else:
+                    QtWidgets.QTreeWidgetItem(parent, [name, item['type'], str(item['size'])])
+        add_items(self.treeWidget, tree_dict)
+        self.treeWidget.expandAll()
+
+    def sort_table(self, column):
+        self.fileTable.sortItems(column, QtCore.Qt.AscendingOrder)
 
     def show_preview(self):
         selected_items = self.fileTable.selectedItems()
@@ -620,7 +634,8 @@ class MainWindow(QtWidgets.QMainWindow):
         info = (f"Устройство: {self.deviceCombo.currentText()}\n"
                 f"MFT addr: {file.get('mft_addr', 'N/A')}\n"
                 f"Статус: {file['status']}\n"
-                f"Дата удаления: {file['deleted_date']}\n\n"
+                f"Дата удаления: {file['deleted_date']}\n"
+                f"Статус восстановления: {file['recovery_status']}\n\n"
                 f"Предпросмотр:\n{preview_text}")
         self.infoText.setPlainText(info)
 
