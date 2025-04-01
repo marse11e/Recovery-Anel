@@ -10,6 +10,7 @@ import platform
 import struct
 from datetime import datetime, timedelta
 import multiprocessing
+from multiprocessing import Manager
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -28,9 +29,30 @@ SIGNATURES = [
     {'ext': 'pdf', 'start': b'%PDF-', 'end': b'%%EOF'},
     {'ext': 'docx', 'start': b'PK\x03\x04', 'end': b'PK\x05\x06'},
     {'ext': 'xlsx', 'start': b'PK\x03\x04', 'end': b'PK\x05\x06'},
-    {'ext': 'mp4', 'start': b'\x00\x00\x00\x18ftyp', 'end': None},  # MP4 без явного конца
+    {'ext': 'mp4', 'start': b'\x00\x00\x00\x18ftyp', 'end': None},
     {'ext': 'zip', 'start': b'PK\x03\x04', 'end': b'PK\x05\x06'},
+    {'ext': 'bmp', 'start': b'BM', 'end': None},
+    {'ext': 'avi', 'start': b'RIFF', 'end': None},
+    {'ext': 'wav', 'start': b'RIFF', 'end': None},
+    {'ext': 'exe', 'start': b'MZ', 'end': None},
 ]
+
+CATEGORY_MAP = {
+    'jpg': 'Image',
+    'png': 'Image',
+    'gif': 'Image',
+    'bmp': 'Image',
+    'pdf': 'Document',
+    'docx': 'Document',
+    'xlsx': 'Document',
+    'txt': 'Text',
+    'mp4': 'Video',
+    'avi': 'Video',
+    'wav': 'Audio',
+    'zip': 'Archive',
+    'exe': 'Executable',
+    'folder': 'Directory',
+}
 
 # Функция для обнаружения доступных дисков
 def get_available_disks():
@@ -72,7 +94,7 @@ def determine_fs_type(device_path):
 
 # Функция для сканирования сегмента диска по сигнатурам
 def scan_segment(args):
-    device_path, offset, length, overlap, stop_event, signatures = args
+    device_path, offset, length, overlap, stop_event, signatures, log_queue = args
     if stop_event.is_set():
         return []
     results = []
@@ -100,16 +122,19 @@ def scan_segment(args):
                 file_item = {
                     'name': auto_name,
                     'type': sig['ext'].upper(),
+                    'extension': sig['ext'].lower(),
+                    'category': CATEGORY_MAP.get(sig['ext'], 'Other'),
                     'size': file_size,
                     'status': 'Deleted',
-                    'deleted_date': 'N/A',
+                    'deletedړعولداته': 'N/A',
                     'data_offset': offset + start_index,
                     'data_end': offset + end_index
                 }
                 results.append(file_item)
+                log_queue.put(f"Найден файл: {auto_name}")
                 pos = end_index
-    except Exception:
-        pass
+    except Exception as e:
+        log_queue.put(f"Ошибка в scan_segment: {e}")
     return results
 
 # Класс для восстановления файлов
@@ -118,6 +143,7 @@ class FileRecoveryEngine(QtCore.QObject):
     logMessage = QtCore.pyqtSignal(str)
     scanFinished = QtCore.pyqtSignal(list)
     recoveryFinished = QtCore.pyqtSignal()
+    progressModeChanged = QtCore.pyqtSignal(str)  # 'indeterminate' or 'determinate'
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -156,13 +182,17 @@ class FileRecoveryEngine(QtCore.QObject):
                 filename = entry.info.name.name.decode()
                 _, file_extension = os.path.splitext(filename)
                 if entry.info.name.type == pytsk3.TSK_FS_NAME_TYPE_REG:
-                    data_type = file_extension
+                    extension = file_extension.lstrip('.').lower()
+                    category = CATEGORY_MAP.get(extension, 'Other')
                 elif entry.info.name.type == pytsk3.TSK_FS_NAME_TYPE_DIR:
-                    data_type = "Folder."
+                    extension = 'folder'
+                    category = 'Directory'
                 accessed_time = datetime.fromtimestamp(entry.info.meta.mtime) + timedelta(hours=5)
                 file_item = {
                     'name': name,
-                    'type': data_type,
+                    'type': data_type if data_type else extension,
+                    'extension': extension,
+                    'category': category,
                     'size': entry.info.meta.size,
                     'status': 'Deleted',
                     'deleted_date': accessed_time.strftime('%Y-%m-%d %H:%M:%S'),
@@ -198,17 +228,37 @@ class FileRecoveryEngine(QtCore.QObject):
         file_size = os.path.getsize(device_path)
         if file_size > LARGE_DISK_THRESHOLD:
             self.logMessage.emit("Большой диск – параллельное сканирование...")
+            manager = Manager()
+            log_queue = manager.Queue()
             pool = multiprocessing.Pool()
             segments = []
             seg_size = block_size * 10
             for offset in range(0, file_size, seg_size):
                 length = seg_size if offset + seg_size < file_size else file_size - offset
-                segments.append((device_path, offset, length, overlap, self.stop_event, SIGNATURES))
-            pool_results = pool.map(scan_segment, segments)
+                segments.append((device_path, offset, length, overlap, self.stop_event, SIGNATURES, log_queue))
+            total_segments = len(segments)
+            processed = 0
+
+            def callback(res):
+                nonlocal processed
+                results.extend(res)
+                processed += 1
+                progress = (processed / total_segments) * 100
+                self.progressChanged.emit(int(progress))
+
+            for seg in segments:
+                pool.apply_async(scan_segment, args=(seg,), callback=callback)
+
             pool.close()
+            while processed < total_segments and not self.stop_event.is_set():
+                try:
+                    while not log_queue.empty():
+                        message = log_queue.get_nowait()
+                        self.logMessage.emit(message)
+                except queue.Empty:
+                    pass
+                time.sleep(0.1)
             pool.join()
-            for seg in pool_results:
-                results.extend(seg)
         else:
             try:
                 with open(device_path, 'rb') as f:
@@ -239,6 +289,8 @@ class FileRecoveryEngine(QtCore.QObject):
                                 file_item = {
                                     'name': auto_name,
                                     'type': sig['ext'].upper(),
+                                    'extension': sig['ext'].lower(),
+                                    'category': CATEGORY_MAP.get(sig['ext'], 'Other'),
                                     'size': file_size_found,
                                     'status': 'Deleted',
                                     'deleted_date': 'N/A',
@@ -251,6 +303,8 @@ class FileRecoveryEngine(QtCore.QObject):
                         if len(buffer) > overlap:
                             buffer = buffer[-overlap:]
                         offset += block_size
+                        progress = (offset / file_size) * 100
+                        self.progressChanged.emit(int(progress))
             except Exception as e:
                 self.logMessage.emit(f"Ошибка при поиске сигнатур: {e}")
         self.logMessage.emit("Сканирование по сигнатурам завершено.")
