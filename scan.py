@@ -9,7 +9,7 @@ import random
 import platform
 import struct
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -100,7 +100,6 @@ class FileRecoveryEngine(QtCore.QObject):
     # ------------------------------------------------------------------
     def recursive_scan(self, fs, directory, results):
         for entry in directory:
-            # Пропускаем специальные записи
             if entry.info.name.name in [b".", b".."]:
                 continue
             try:
@@ -110,14 +109,38 @@ class FileRecoveryEngine(QtCore.QObject):
             if entry.info.meta is None:
                 continue
 
-            # Если файл отмечен как удалённый, добавляем его в результаты
             if entry.info.meta.flags & pytsk3.TSK_FS_META_FLAG_UNALLOC:
+
+                data_type = ""
+                # print(dir(entry.info))
+                # print(dir(entry.info.name))
+                print("pytsk3.TSK_FS_NAME_TYPE_REG", dir(pytsk3.TSK_FS_NAME_TYPE_REG))
+                filename = entry.info.name.name.decode() 
+                _, file_extension = os.path.splitext(filename)
+
+                print(f"Расширение файла: {file_extension}")
+                print(entry.info.name.type)
+                if entry.info.name.type == pytsk3.TSK_FS_NAME_TYPE_REG:
+                    data_type = file_extension
+
+                elif entry.info.name.type == pytsk3.TSK_FS_NAME_TYPE_DIR:
+                    data_type = "Folder."
+
+
+                if entry.info.meta.flags & pytsk3.TSK_FS_META_FLAG_UNALLOC:
+                    print(f"Файл {entry.info.name.name.decode()} был удален.")
+                else:
+                    print(f"Файл {entry.info.name.name.decode()} существует.")
+
+
+                accessed_time = datetime.fromtimestamp(entry.info.meta.mtime) + timedelta(hours=5)
+
                 file_item = {
                     'name': name,
-                    'type': 'Unknown',
-                    'size': entry.info.meta.size,
+                    'type': f"{data_type}",
+                    'size': f"{entry.info.meta.size}",
                     'status': 'Deleted',
-                    'deleted_date': 'N/A',
+                    'deleted_date': f"{accessed_time}",
                     'mft_addr': entry.info.meta.addr
                 }
                 results.append(file_item)
