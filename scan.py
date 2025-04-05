@@ -12,7 +12,10 @@ import queue
 import logging
 from datetime import datetime, timedelta
 import multiprocessing
-import pwd, grp
+import pwd
+import grp
+import math
+import traceback
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -54,6 +57,8 @@ SIGNATURES = [
 ]
 
 # Настройка логирования с использованием очереди для многопоточности
+
+
 class QueueHandler(logging.Handler):
     def __init__(self, log_queue):
         super().__init__()
@@ -62,12 +67,14 @@ class QueueHandler(logging.Handler):
     def emit(self, record):
         self.log_queue.put(record)
 
+
 def setup_logging(log_queue):
     handler = QueueHandler(log_queue)
     logger = logging.getLogger('recovery')
     logger.setLevel(logging.INFO)
     logger.addHandler(handler)
     return logger
+
 
 def get_available_disks():
     disks = []
@@ -87,6 +94,7 @@ def get_available_disks():
                     disks.append(os.path.join(dev_dir, device))
     return disks
 
+
 def determine_fs_type(device_path):
     try:
         with open(device_path, 'rb') as f:
@@ -104,6 +112,7 @@ def determine_fs_type(device_path):
     except Exception as e:
         print(f"Ошибка определения ФС: {e}")
     return "Unknown"
+
 
 def scan_segment(args):
     device_path, offset, length, overlap, stop_event, pause_event, signatures = args
@@ -134,7 +143,7 @@ def scan_segment(args):
                 else:
                     end_index = start_index + 1024 * 1024
                 file_size = end_index - start_index
-                auto_name = f"recovered_{sig['ext']}_{offset+start_index}_{random.randint(1000,9999)}.{sig['ext']}"
+                auto_name = f"recovered_{sig['ext']}_{offset+start_index}_{random.randint(1000, 9999)}.{sig['ext']}"
                 file_item = {
                     'name': auto_name,
                     'type': sig['ext'].upper(),
@@ -150,6 +159,7 @@ def scan_segment(args):
     except Exception:
         pass
     return results
+
 
 class FileRecoveryEngine(QtCore.QObject):
     progressChanged = QtCore.pyqtSignal(int)
@@ -187,9 +197,9 @@ class FileRecoveryEngine(QtCore.QObject):
         # Не проверяем для Windows
         if sys.platform == 'win32':
             return True
-            
+
         self.device_requires_root = False
-        
+
         # Проверка прав на чтение устройства
         try:
             # Пробуем открыть устройство для чтения
@@ -199,10 +209,11 @@ class FileRecoveryEngine(QtCore.QObject):
         except PermissionError:
             self.log(f"Не хватает прав для доступа к устройству {device_path}")
             self.device_requires_root = True
-            
+
             # Проверяем, является ли текущий пользователь root
             if os.getuid() != 0:
-                self.log("Для доступа к этому устройству требуются привилегии root")
+                self.log(
+                    "Для доступа к этому устройству требуются привилегии root")
                 if not self.root_warning_shown:
                     self.rootWarningNeeded.emit()
                     self.root_warning_shown = True
@@ -214,13 +225,14 @@ class FileRecoveryEngine(QtCore.QObject):
     def open_disk_direct(self, device_path):
         try:
             self.log(f"Открытие устройства {device_path}...")
-            
+
             # Проверяем права доступа
             if not self.check_device_permissions(device_path):
                 if self.device_requires_root:
-                    self.log("Для доступа к устройству требуются права root. Запустите программу через sudo.")
+                    self.log(
+                        "Для доступа к устройству требуются права root. Запустите программу через sudo.")
                 return False
-                
+
             time.sleep(0.5)
             return True
         except Exception as e:
@@ -256,7 +268,8 @@ class FileRecoveryEngine(QtCore.QObject):
                     data_type = file_extension.lstrip('.').upper()
                 elif entry.info.name.type == pytsk3.TSK_FS_NAME_TYPE_DIR:
                     data_type = "Folder"
-                accessed_time = datetime.fromtimestamp(entry.info.meta.mtime) + timedelta(hours=5)
+                accessed_time = datetime.fromtimestamp(
+                    entry.info.meta.mtime) + timedelta(hours=5)
                 file_item = {
                     'name': name,
                     'type': data_type,
@@ -289,105 +302,82 @@ class FileRecoveryEngine(QtCore.QObject):
         return results
 
     # Улучшенная функция сканирования по сигнатурам с лучшей обработкой многопроцессности
-    def scan_by_signature(self, device_path, total_size):
-        self.log("Поиск файлов по сигнатурам...")
-        results = []
-        block_size = 1024 * 1024  # 1 МБ
-        overlap = 1024
+    def scan_by_signature(self):
+        """Сканирование диска по сигнатурам файлов."""
+        self.log("Начало сканирования по сигнатурам...")
+        
+        # Проверяем, что устройство установлено
+        if not self.current_device or not os.path.exists(self.current_device):
+            self.log("Ошибка: устройство не найдено или не выбрано")
+            return []
+        
+        all_found_files = []
         
         try:
-            file_size = os.path.getsize(device_path)
+            # Получаем размер файла устройства
+            file_size = os.path.getsize(self.current_device)
+            self.log(f"Размер диска: {file_size} байт")
             
-            # Определяем оптимальное количество процессов
-            num_cpus = multiprocessing.cpu_count()
-            
-            if file_size > LARGE_DISK_THRESHOLD:
-                self.log(f"Большой диск – параллельное сканирование с использованием {num_cpus} ядер...")
+            # Для больших дисков используем мультипроцессинг
+            if file_size > self.LARGE_DISK_THRESHOLD:
+                self.log("Обнаружен большой диск. Используем многопроцессное сканирование.")
+                # Определяем количество ядер и оптимальный размер сегмента
+                num_cores = min(multiprocessing.cpu_count(), 8)  # Не более 8 процессов
+                segment_size = math.ceil(file_size / num_cores)
                 
-                # Размер сегмента зависит от размера диска и количества ядер
-                total_segments = num_cpus * 2  # Используем в 2 раза больше сегментов, чем ядер
-                seg_size = max(block_size * 10, file_size // total_segments)
-                
-                # Создаем пул процессов с меньшим количеством, чем максимально доступно
-                pool = multiprocessing.Pool(processes=num_cpus)
-                
-                # Подготавливаем сегменты для сканирования
-                segments = []
-                for offset in range(0, file_size, seg_size):
-                    length = seg_size if offset + seg_size < file_size else file_size - offset
-                    segments.append((device_path, offset, length, overlap, self.stop_event, self.pause_event, SIGNATURES))
-                    completion = min(100, int((offset / file_size) * 100))
-                    self.progressChanged.emit(completion)
-                
-                # Обработка сегментов с функцией обратного вызова
-                for i, segment_results in enumerate(pool.imap_unordered(scan_segment, segments)):
-                    if self.stop_event.is_set():
-                        break
-                    results.extend(segment_results)
-                    # Обновляем прогресс с учетом завершенных сегментов
-                    completion = min(100, int(((i + 1) / len(segments)) * 100))
-                    self.progressChanged.emit(completion)
-                    # Периодически сообщаем статус
-                    if i % 5 == 0 or i == len(segments) - 1:
-                        self.log(f"Обработано сегментов: {i+1}/{len(segments)}, найдено файлов: {len(results)}")
-                
-                pool.close()
-                pool.join()
+                # Создаем пул процессов
+                with multiprocessing.Pool(processes=num_cores) as pool:
+                    # Подготавливаем сегменты для сканирования
+                    segments = []
+                    for i in range(num_cores):
+                        start = i * segment_size
+                        end = min((i + 1) * segment_size, file_size)
+                        segments.append((self.current_device, start, end, self.signatures))
+                    
+                    # Отображаем прогресс-бар
+                    self.progressBar.setMaximum(100)
+                    self.progressBar.setValue(0)
+                    
+                    # Запускаем многопроцессное сканирование
+                    self.log(f"Запуск {num_cores} процессов для сканирования...")
+                    results = []
+                    
+                    # Используем apply_async для асинхронного выполнения
+                    for segment in segments:
+                        result = pool.apply_async(self._scan_segment, segment)
+                        results.append(result)
+                    
+                    # Отслеживаем завершение процессов и обновляем прогресс
+                    total_segments = len(segments)
+                    completed = 0
+                    while completed < total_segments:
+                        completed = sum(1 for r in results if r.ready())
+                        progress = int((completed / total_segments) * 100)
+                        self.progressBar.setValue(progress)
+                        self.log(f"Прогресс сканирования: {progress}%", update=True)
+                        QtWidgets.QApplication.processEvents()
+                        time.sleep(0.5)
+                    
+                    # Собираем результаты
+                    for result in results:
+                        segment_files = result.get()
+                        all_found_files.extend(segment_files)
             else:
-                try:
-                    with open(device_path, 'rb') as f:
-                        offset = 0
-                        buffer = b""
-                        while not self.stop_event.is_set():
-                            while self.pause_event.is_set():
-                                time.sleep(0.1)
-                            data = f.read(block_size)
-                            if not data:
-                                break
-                            buffer += data
-                            for sig in SIGNATURES:
-                                start_sig = sig['start']
-                                end_sig = sig['end']
-                                pos = 0
-                                while True:
-                                    start_index = buffer.find(start_sig, pos)
-                                    if start_index == -1:
-                                        break
-                                    if end_sig:
-                                        end_index = buffer.find(end_sig, start_index)
-                                        if end_index == -1:
-                                            break
-                                        end_index += len(end_sig)
-                                    else:
-                                        end_index = start_index + 1024 * 1024
-                                    file_size_found = end_index - start_index
-                                    auto_name = f"recovered_{sig['ext']}_{offset+start_index}_{random.randint(1000,9999)}.{sig['ext']}"
-                                    file_item = {
-                                        'name': auto_name,
-                                        'type': sig['ext'].upper(),
-                                        'size': file_size_found,
-                                        'status': 'Deleted',
-                                        'deleted_date': 'N/A',
-                                        'data_offset': offset + start_index,
-                                        'data_end': offset + end_index,
-                                        'recovery_status': 'Fully' if file_size_found > 0 else 'Impossible'
-                                    }
-                                    results.append(file_item)
-                                    self.log(f"Найден файл: {auto_name}")
-                                    pos = end_index
-                            if len(buffer) > overlap:
-                                buffer = buffer[-overlap:]
-                            offset += block_size
-                            completion = min(100, int((offset / file_size) * 100))
-                            self.progressChanged.emit(completion)
-                except Exception as e:
-                    self.log(f"Ошибка при поиске сигнатур: {e}")
+                # Для маленьких дисков сканируем в одном процессе
+                self.log("Стандартное сканирование в одном процессе.")
+                self.progressBar.setMaximum(100)
                 
+                # Сканируем весь диск одним процессом
+                all_found_files = self._scan_segment(self.current_device, 0, file_size, self.signatures)
+                self.progressBar.setValue(100)
+            
+            self.log(f"Сканирование завершено. Найдено {len(all_found_files)} файлов")
+            
         except Exception as e:
-            self.log(f"Ошибка при сканировании по сигнатурам: {e}")
+            self.log(f"Ошибка сканирования: {e}")
+            self.log(f"Трассировка: {traceback.format_exc()}")
         
-        self.log(f"Сканирование по сигнатурам завершено. Найдено файлов: {len(results)}")
-        return results
+        return all_found_files
 
     def scan_disk(self, device_path, deep_scan=False):
         self.stop_event.clear()
@@ -408,7 +398,7 @@ class FileRecoveryEngine(QtCore.QObject):
                 else:
                     self.log("Выполняется сканирование по сигнатурам...")
                 
-                results = self.scan_by_signature(device_path, total_size)
+                results = self.scan_by_signature()
                 
                 # Добавляем результаты из pytsk3, если доступно
                 if deep_scan and pytsk3 and fs_type in ["NTFS", "FAT32", "ext4"]:
@@ -475,6 +465,7 @@ class FileRecoveryEngine(QtCore.QObject):
                         self.log("Остановка восстановления.")
                         break
                     
+                    # Восстанавливаем файл по смещению в данных
                     if 'data_offset' in file:
                         try:
                             disk.seek(file['data_offset'])
@@ -494,7 +485,7 @@ class FileRecoveryEngine(QtCore.QObject):
                                         os.chown(dir_path, effective_uid, effective_gid)
                                     except Exception as e:
                                         self.log(f"Предупреждение: не удалось изменить владельца директории {dir_path}: {e}")
-                        
+                            
                             # Записываем файл
                             with open(out_path, 'wb') as out_file:
                                 out_file.write(data)
@@ -511,6 +502,8 @@ class FileRecoveryEngine(QtCore.QObject):
                             self.log(f"Файл восстановлен: {out_path} ({size} байт)")
                         except Exception as e:
                             self.log(f"Ошибка восстановления {file['name']}: {e}")
+                    
+                    # Восстанавливаем файл по MFT-записи
                     elif 'mft_addr' in file and file['mft_addr']:
                         try:
                             img = pytsk3.Img_Info(device_path)
@@ -535,7 +528,7 @@ class FileRecoveryEngine(QtCore.QObject):
                                         os.chown(dir_path, effective_uid, effective_gid)
                                     except Exception as e:
                                         self.log(f"Предупреждение: не удалось изменить владельца директории {dir_path}: {e}")
-                        
+                            
                             # Записываем файл и устанавливаем права
                             with open(out_path, 'wb') as f:
                                 f.write(data)
@@ -552,6 +545,8 @@ class FileRecoveryEngine(QtCore.QObject):
                             self.log(f"Файл восстановлен: {out_path} ({size} байт)")
                         except Exception as e:
                             self.log(f"Ошибка восстановления {file['name']}: {e}")
+                    
+                    # Восстанавливаем директорию
                     elif file.get('type') == "Folder":
                         try:
                             out_path = os.path.join(output_dir, file['path'].lstrip('/'))
