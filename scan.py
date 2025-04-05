@@ -43,7 +43,6 @@ SIGNATURES = [
     {'ext': 'wav', 'start': b'RIFF', 'end': None},
     {'ext': 'exe', 'start': b'MZ', 'end': None},
     {'ext': 'bmp', 'start': b'BM', 'end': None},
-    # Дополнительные форматы
     {'ext': 'psd', 'start': b'8BPS', 'end': None},
     {'ext': 'tiff', 'start': b'II*\x00', 'end': None},
     {'ext': 'tiff', 'start': b'MM\x00*', 'end': None},
