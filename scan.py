@@ -8,8 +8,11 @@ import time
 import random
 import platform
 import struct
+import queue
+import logging
 from datetime import datetime, timedelta
 import multiprocessing
+import pwd, grp
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -37,7 +40,34 @@ SIGNATURES = [
     {'ext': 'wav', 'start': b'RIFF', 'end': None},
     {'ext': 'exe', 'start': b'MZ', 'end': None},
     {'ext': 'bmp', 'start': b'BM', 'end': None},
+    # Дополнительные форматы
+    {'ext': 'psd', 'start': b'8BPS', 'end': None},
+    {'ext': 'tiff', 'start': b'II*\x00', 'end': None},
+    {'ext': 'tiff', 'start': b'MM\x00*', 'end': None},
+    {'ext': 'svg', 'start': b'<?xml', 'end': b'</svg>'},
+    {'ext': 'webp', 'start': b'RIFF', 'end': None},
+    {'ext': 'mov', 'start': b'\x00\x00\x00\x14ftyp', 'end': None},
+    {'ext': 'ppt', 'start': b'\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1', 'end': None},
+    {'ext': 'pptx', 'start': b'PK\x03\x04', 'end': b'PK\x05\x06'},
+    {'ext': 'epub', 'start': b'PK\x03\x04', 'end': b'PK\x05\x06'},
+    {'ext': 'rar', 'start': b'Rar!\x1A\x07\x00', 'end': None},
 ]
+
+# Настройка логирования с использованием очереди для многопоточности
+class QueueHandler(logging.Handler):
+    def __init__(self, log_queue):
+        super().__init__()
+        self.log_queue = log_queue
+
+    def emit(self, record):
+        self.log_queue.put(record)
+
+def setup_logging(log_queue):
+    handler = QueueHandler(log_queue)
+    logger = logging.getLogger('recovery')
+    logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+    return logger
 
 def get_available_disks():
     disks = []
@@ -126,25 +156,81 @@ class FileRecoveryEngine(QtCore.QObject):
     logMessage = QtCore.pyqtSignal(str)
     scanFinished = QtCore.pyqtSignal(list)
     recoveryFinished = QtCore.pyqtSignal()
+    rootWarningNeeded = QtCore.pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        # Используем общие события для многопроцессорной обработки
         self.stop_event = multiprocessing.Event()
         self.pause_event = multiprocessing.Event()
+        self.log_queue = multiprocessing.Queue()
+        self.logger = setup_logging(self.log_queue)
+        self.log_timer = QtCore.QTimer()
+        self.log_timer.timeout.connect(self._process_logs)
+        self.log_timer.start(100)  # Проверка логов каждые 100 мс
+        self.device_requires_root = False
+        self.root_warning_shown = False
+
+    def _process_logs(self):
+        while not self.log_queue.empty():
+            try:
+                record = self.log_queue.get(block=False)
+                self.logMessage.emit(record.getMessage())
+            except queue.Empty:
+                break
+
+    def log(self, message):
+        self.logger.info(message)
+
+    # Добавлен новый метод для проверки прав доступа к устройству
+    def check_device_permissions(self, device_path):
+        # Не проверяем для Windows
+        if sys.platform == 'win32':
+            return True
+            
+        self.device_requires_root = False
+        
+        # Проверка прав на чтение устройства
+        try:
+            # Пробуем открыть устройство для чтения
+            with open(device_path, 'rb') as f:
+                f.read(1)  # Читаем 1 байт для проверки
+            return True
+        except PermissionError:
+            self.log(f"Не хватает прав для доступа к устройству {device_path}")
+            self.device_requires_root = True
+            
+            # Проверяем, является ли текущий пользователь root
+            if os.getuid() != 0:
+                self.log("Для доступа к этому устройству требуются привилегии root")
+                if not self.root_warning_shown:
+                    self.rootWarningNeeded.emit()
+                    self.root_warning_shown = True
+            return False
+        except Exception as e:
+            self.log(f"Ошибка при проверке доступа к устройству: {e}")
+            return False
 
     def open_disk_direct(self, device_path):
         try:
-            self.logMessage.emit(f"Открытие устройства {device_path}...")
+            self.log(f"Открытие устройства {device_path}...")
+            
+            # Проверяем права доступа
+            if not self.check_device_permissions(device_path):
+                if self.device_requires_root:
+                    self.log("Для доступа к устройству требуются права root. Запустите программу через sudo.")
+                return False
+                
             time.sleep(0.5)
             return True
         except Exception as e:
-            self.logMessage.emit(f"Ошибка открытия устройства: {e}")
+            self.log(f"Ошибка открытия устройства: {e}")
             return False
 
     def determine_filesystem(self, device_path):
-        self.logMessage.emit("Определение типа файловой системы...")
+        self.log("Определение типа файловой системы...")
         fs = determine_fs_type(device_path)
-        self.logMessage.emit(f"Определена файловая система: {fs}")
+        self.log(f"Определена файловая система: {fs}")
         return fs
 
     def recursive_scan(self, fs, directory, results, path="/"):
@@ -182,16 +268,16 @@ class FileRecoveryEngine(QtCore.QObject):
                     'recovery_status': 'Fully' if entry.info.meta.size > 0 else 'Impossible'
                 }
                 results.append(file_item)
-                self.logMessage.emit(f"Найден удалённый файл/папка: {full_path}")
+                self.log(f"Найден удалённый файл/папка: {full_path}")
             if entry.info.meta.type == pytsk3.TSK_FS_META_TYPE_DIR:
                 try:
                     sub_directory = entry.as_directory()
                     self.recursive_scan(fs, sub_directory, results, full_path)
                 except Exception as e:
-                    self.logMessage.emit(f"Ошибка при обходе каталога {full_path}: {e}")
+                    self.log(f"Ошибка при обходе каталога {full_path}: {e}")
 
     def scan_with_pytsk3(self, device_path):
-        self.logMessage.emit("Сканирование с использованием pytsk3...")
+        self.log("Сканирование с использованием pytsk3...")
         results = []
         try:
             img = pytsk3.Img_Info(device_path)
@@ -199,150 +285,342 @@ class FileRecoveryEngine(QtCore.QObject):
             root_dir = fs.open_dir(path="/")
             self.recursive_scan(fs, root_dir, results)
         except Exception as e:
-            self.logMessage.emit(f"Ошибка сканирования: {e}")
+            self.log(f"Ошибка сканирования: {e}")
         return results
 
+    # Улучшенная функция сканирования по сигнатурам с лучшей обработкой многопроцессности
     def scan_by_signature(self, device_path, total_size):
-        self.logMessage.emit("Поиск файлов по сигнатурам...")
+        self.log("Поиск файлов по сигнатурам...")
         results = []
         block_size = 1024 * 1024  # 1 МБ
         overlap = 1024
-        file_size = os.path.getsize(device_path)
-        if file_size > LARGE_DISK_THRESHOLD:
-            self.logMessage.emit("Большой диск – параллельное сканирование...")
-            pool = multiprocessing.Pool()
-            segments = []
-            seg_size = block_size * 10
-            for offset in range(0, file_size, seg_size):
-                length = seg_size if offset + seg_size < file_size else file_size - offset
-                segments.append((device_path, offset, length, overlap, self.stop_event, self.pause_event, SIGNATURES))
-                self.progressChanged.emit(int((offset / file_size) * 100))
-            pool_results = pool.map(scan_segment, segments)
-            pool.close()
-            pool.join()
-            for seg in pool_results:
-                results.extend(seg)
-        else:
-            try:
-                with open(device_path, 'rb') as f:
-                    offset = 0
-                    buffer = b""
-                    while not self.stop_event.is_set():
-                        while self.pause_event.is_set():
-                            time.sleep(0.1)
-                        data = f.read(block_size)
-                        if not data:
-                            break
-                        buffer += data
-                        for sig in SIGNATURES:
-                            start_sig = sig['start']
-                            end_sig = sig['end']
-                            pos = 0
-                            while True:
-                                start_index = buffer.find(start_sig, pos)
-                                if start_index == -1:
-                                    break
-                                if end_sig:
-                                    end_index = buffer.find(end_sig, start_index)
-                                    if end_index == -1:
+        
+        try:
+            file_size = os.path.getsize(device_path)
+            
+            # Определяем оптимальное количество процессов
+            num_cpus = multiprocessing.cpu_count()
+            
+            if file_size > LARGE_DISK_THRESHOLD:
+                self.log(f"Большой диск – параллельное сканирование с использованием {num_cpus} ядер...")
+                
+                # Размер сегмента зависит от размера диска и количества ядер
+                total_segments = num_cpus * 2  # Используем в 2 раза больше сегментов, чем ядер
+                seg_size = max(block_size * 10, file_size // total_segments)
+                
+                # Создаем пул процессов с меньшим количеством, чем максимально доступно
+                pool = multiprocessing.Pool(processes=num_cpus)
+                
+                # Подготавливаем сегменты для сканирования
+                segments = []
+                for offset in range(0, file_size, seg_size):
+                    length = seg_size if offset + seg_size < file_size else file_size - offset
+                    segments.append((device_path, offset, length, overlap, self.stop_event, self.pause_event, SIGNATURES))
+                    completion = min(100, int((offset / file_size) * 100))
+                    self.progressChanged.emit(completion)
+                
+                # Обработка сегментов с функцией обратного вызова
+                for i, segment_results in enumerate(pool.imap_unordered(scan_segment, segments)):
+                    if self.stop_event.is_set():
+                        break
+                    results.extend(segment_results)
+                    # Обновляем прогресс с учетом завершенных сегментов
+                    completion = min(100, int(((i + 1) / len(segments)) * 100))
+                    self.progressChanged.emit(completion)
+                    # Периодически сообщаем статус
+                    if i % 5 == 0 or i == len(segments) - 1:
+                        self.log(f"Обработано сегментов: {i+1}/{len(segments)}, найдено файлов: {len(results)}")
+                
+                pool.close()
+                pool.join()
+            else:
+                try:
+                    with open(device_path, 'rb') as f:
+                        offset = 0
+                        buffer = b""
+                        while not self.stop_event.is_set():
+                            while self.pause_event.is_set():
+                                time.sleep(0.1)
+                            data = f.read(block_size)
+                            if not data:
+                                break
+                            buffer += data
+                            for sig in SIGNATURES:
+                                start_sig = sig['start']
+                                end_sig = sig['end']
+                                pos = 0
+                                while True:
+                                    start_index = buffer.find(start_sig, pos)
+                                    if start_index == -1:
                                         break
-                                    end_index += len(end_sig)
-                                else:
-                                    end_index = start_index + 1024 * 1024
-                                file_size_found = end_index - start_index
-                                auto_name = f"recovered_{sig['ext']}_{offset+start_index}_{random.randint(1000,9999)}.{sig['ext']}"
-                                file_item = {
-                                    'name': auto_name,
-                                    'type': sig['ext'].upper(),
-                                    'size': file_size_found,
-                                    'status': 'Deleted',
-                                    'deleted_date': 'N/A',
-                                    'data_offset': offset + start_index,
-                                    'data_end': offset + end_index,
-                                    'recovery_status': 'Fully' if file_size_found > 0 else 'Impossible'
-                                }
-                                results.append(file_item)
-                                self.logMessage.emit(f"Найден файл: {auto_name}")
-                                pos = end_index
-                        if len(buffer) > overlap:
-                            buffer = buffer[-overlap:]
-                        offset += block_size
-                        self.progressChanged.emit(int((offset / file_size) * 100))
-            except Exception as e:
-                self.logMessage.emit(f"Ошибка при поиске сигнатур: {e}")
-        self.logMessage.emit("Сканирование по сигнатурам завершено.")
+                                    if end_sig:
+                                        end_index = buffer.find(end_sig, start_index)
+                                        if end_index == -1:
+                                            break
+                                        end_index += len(end_sig)
+                                    else:
+                                        end_index = start_index + 1024 * 1024
+                                    file_size_found = end_index - start_index
+                                    auto_name = f"recovered_{sig['ext']}_{offset+start_index}_{random.randint(1000,9999)}.{sig['ext']}"
+                                    file_item = {
+                                        'name': auto_name,
+                                        'type': sig['ext'].upper(),
+                                        'size': file_size_found,
+                                        'status': 'Deleted',
+                                        'deleted_date': 'N/A',
+                                        'data_offset': offset + start_index,
+                                        'data_end': offset + end_index,
+                                        'recovery_status': 'Fully' if file_size_found > 0 else 'Impossible'
+                                    }
+                                    results.append(file_item)
+                                    self.log(f"Найден файл: {auto_name}")
+                                    pos = end_index
+                            if len(buffer) > overlap:
+                                buffer = buffer[-overlap:]
+                            offset += block_size
+                            completion = min(100, int((offset / file_size) * 100))
+                            self.progressChanged.emit(completion)
+                except Exception as e:
+                    self.log(f"Ошибка при поиске сигнатур: {e}")
+                
+        except Exception as e:
+            self.log(f"Ошибка при сканировании по сигнатурам: {e}")
+        
+        self.log(f"Сканирование по сигнатурам завершено. Найдено файлов: {len(results)}")
         return results
 
     def scan_disk(self, device_path, deep_scan=False):
         self.stop_event.clear()
         self.pause_event.clear()
-        self.logMessage.emit(f"Начало сканирования диска: {device_path}")
+        self.log(f"Начало сканирования диска: {device_path}")
         fs_type = self.determine_filesystem(device_path)
         results = []
         total_size = os.path.getsize(device_path)
         try:
             if not deep_scan and pytsk3 is not None and fs_type in ["NTFS", "FAT32", "ext4"]:
+                # Быстрое сканирование по метаданным
+                self.log("Выполняется быстрое сканирование по метаданным...")
                 results = self.scan_with_pytsk3(device_path)
             else:
+                # Глубокое сканирование включает оба метода
+                if deep_scan:
+                    self.log("Выполняется глубокое сканирование...")
+                else:
+                    self.log("Выполняется сканирование по сигнатурам...")
+                
                 results = self.scan_by_signature(device_path, total_size)
-                if pytsk3 and fs_type in ["NTFS", "FAT32", "ext4"]:
-                    results.extend(self.scan_with_pytsk3(device_path))
+                
+                # Добавляем результаты из pytsk3, если доступно
+                if deep_scan and pytsk3 and fs_type in ["NTFS", "FAT32", "ext4"]:
+                    self.log("Дополняем сканирование метаданными...")
+                    pytsk_results = self.scan_with_pytsk3(device_path)
+                    # Объединяем результаты, избегая дубликатов
+                    existing_paths = set(r.get('path', '') for r in results)
+                    for r in pytsk_results:
+                        if r.get('path', '') not in existing_paths:
+                            results.append(r)
+                            existing_paths.add(r.get('path', ''))
         except Exception as e:
-            self.logMessage.emit(f"Ошибка при сканировании: {e}")
-        self.logMessage.emit("Сканирование завершено.")
+            self.log(f"Ошибка при сканировании: {e}")
+        
+        self.log(f"Сканирование завершено. Найдено {len(results)} файлов/папок.")
         self.progressChanged.emit(100)
         self.scanFinished.emit(results)
 
     def recover_files(self, files, output_dir, device_path):
-        self.logMessage.emit("Начало восстановления файлов...")
+        self.log("Начало восстановления файлов...")
+        recovered_count = 0
+        
+        # Обработка прав доступа с учетом платформы
+        is_windows = sys.platform == 'win32'
+        
+        if not is_windows:
+            # Получаем UID и GID текущего пользователя
+            current_uid = os.getuid()
+            current_gid = os.getgid()
+            
+            # Если программа запущена от root, пытаемся определить реального пользователя
+            effective_uid = current_uid
+            effective_gid = current_gid
+            
+            # Проверяем, запущена ли программа с sudo
+            sudo_uid = os.environ.get('SUDO_UID')
+            sudo_gid = os.environ.get('SUDO_GID')
+            
+            if current_uid == 0 and sudo_uid is not None:
+                # Если запущено через sudo, используем реального пользователя
+                effective_uid = int(sudo_uid)
+                effective_gid = int(sudo_gid) if sudo_gid else current_gid
+                try:
+                    username = pwd.getpwuid(effective_uid).pw_name
+                    self.log(f"Программа запущена от root, но восстановление будет для пользователя: {username}")
+                except:
+                    self.log("Программа запущена от root, используется пользователь из SUDO_UID")
+            else:
+                # Обычный пользователь или root без sudo
+                try:
+                    username = pwd.getpwuid(current_uid).pw_name
+                    self.log(f"Восстановление будет производиться для пользователя: {username}")
+                except:
+                    self.log("Не удалось определить имя текущего пользователя")
+        else:
+            self.log("Windows: особая обработка прав доступа не требуется")
+            effective_uid = None
+            effective_gid = None
+        
         try:
             with open(device_path, 'rb') as disk:
                 for file in files:
                     if self.stop_event.is_set():
-                        self.logMessage.emit("Остановка восстановления.")
+                        self.log("Остановка восстановления.")
                         break
+                    
                     if 'data_offset' in file:
                         try:
                             disk.seek(file['data_offset'])
                             size = file['data_end'] - file['data_offset']
                             data = disk.read(size)
+                            
+                            # Создаем полный путь к файлу для восстановления
                             out_path = os.path.join(output_dir, file['name'])
-                            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                            dir_path = os.path.dirname(out_path)
+                            
+                            # Создаем директории с правильными правами доступа
+                            if not os.path.exists(dir_path):
+                                os.makedirs(dir_path, exist_ok=True, mode=0o775 if not is_windows else 0o777)
+                                # Меняем владельца директории только для Linux/Unix
+                                if not is_windows and effective_uid is not None:
+                                    try:
+                                        os.chown(dir_path, effective_uid, effective_gid)
+                                    except Exception as e:
+                                        self.log(f"Предупреждение: не удалось изменить владельца директории {dir_path}: {e}")
+                        
+                            # Записываем файл
                             with open(out_path, 'wb') as out_file:
                                 out_file.write(data)
-                            os.chmod(os.path.dirname(out_path), 0o755)
-                            self.logMessage.emit(f"Файл восстановлен: {out_path} ({size} байт)")
+                            
+                            # Устанавливаем расширенные права и владельца файла
+                            try:
+                                os.chmod(out_path, 0o664 if not is_windows else 0o666)
+                                if not is_windows and effective_uid is not None:
+                                    os.chown(out_path, effective_uid, effective_gid)
+                            except Exception as e:
+                                self.log(f"Предупреждение: не удалось установить права для {out_path}: {e}")
+                            
+                            recovered_count += 1
+                            self.log(f"Файл восстановлен: {out_path} ({size} байт)")
                         except Exception as e:
-                            self.logMessage.emit(f"Ошибка восстановления {file['name']}: {e}")
+                            self.log(f"Ошибка восстановления {file['name']}: {e}")
                     elif 'mft_addr' in file and file['mft_addr']:
                         try:
                             img = pytsk3.Img_Info(device_path)
                             fs = pytsk3.FS_Info(img)
                             file_entry = fs.open_meta(file['mft_addr'])
                             size = file_entry.info.meta.size
+                            
                             if size <= 0:
-                                self.logMessage.emit(f"Пропуск файла {file['name']}: недопустимый размер.")
+                                self.log(f"Пропуск файла {file['name']}: недопустимый размер.")
                                 continue
+                                
                             data = file_entry.read_random(0, size)
                             out_path = os.path.join(output_dir, file['path'].lstrip('/'))
-                            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                            dir_path = os.path.dirname(out_path)
+                            
+                            # Создаем директории с правильными правами доступа
+                            if not os.path.exists(dir_path):
+                                os.makedirs(dir_path, exist_ok=True, mode=0o775 if not is_windows else 0o777)
+                                # Меняем владельца директории только для Linux/Unix
+                                if not is_windows and effective_uid is not None:
+                                    try:
+                                        os.chown(dir_path, effective_uid, effective_gid)
+                                    except Exception as e:
+                                        self.log(f"Предупреждение: не удалось изменить владельца директории {dir_path}: {e}")
+                        
+                            # Записываем файл и устанавливаем права
                             with open(out_path, 'wb') as f:
                                 f.write(data)
-                            os.chmod(os.path.dirname(out_path), 0o755)
-                            self.logMessage.emit(f"Файл восстановлен: {out_path} ({size} байт)")
+                            
+                            # Устанавливаем расширенные права и владельца файла
+                            try:
+                                os.chmod(out_path, 0o664 if not is_windows else 0o666)
+                                if not is_windows and effective_uid is not None:
+                                    os.chown(out_path, effective_uid, effective_gid)
+                            except Exception as e:
+                                self.log(f"Предупреждение: не удалось установить права для {out_path}: {e}")
+                            
+                            recovered_count += 1
+                            self.log(f"Файл восстановлен: {out_path} ({size} байт)")
                         except Exception as e:
-                            self.logMessage.emit(f"Ошибка восстановления {file['name']}: {e}")
+                            self.log(f"Ошибка восстановления {file['name']}: {e}")
                     elif file.get('type') == "Folder":
                         try:
                             out_path = os.path.join(output_dir, file['path'].lstrip('/'))
-                            os.makedirs(out_path, exist_ok=True)
-                            os.chmod(out_path, 0o755)
-                            self.logMessage.emit(f"Папка восстановлена: {out_path}")
+                            os.makedirs(out_path, exist_ok=True, mode=0o775 if not is_windows else 0o777)
+                            
+                            # Меняем владельца директории только для Linux/Unix
+                            if not is_windows and effective_uid is not None:
+                                try:
+                                    os.chown(out_path, effective_uid, effective_gid)
+                                except Exception as e:
+                                    self.log(f"Предупреждение: не удалось изменить владельца директории {out_path}: {e}")
+                            
+                            recovered_count += 1
+                            self.log(f"Папка восстановлена: {out_path}")
                         except Exception as e:
-                            self.logMessage.emit(f"Ошибка восстановления папки {file['name']}: {e}")
-            self.logMessage.emit("Восстановление завершено.")
+                            self.log(f"Ошибка восстановления папки {file['name']}: {e}")
+            
+            # Обеспечиваем правильные права на корневую директорию восстановления
+            if not is_windows:
+                try:
+                    os.chmod(output_dir, 0o775)
+                    if effective_uid is not None:
+                        os.chown(output_dir, effective_uid, effective_gid)
+                    
+                    # Рекурсивно устанавливаем права на все восстановленные файлы и папки
+                    self.log("Установка прав доступа на все восстановленные файлы...")
+                    for root, dirs, files in os.walk(output_dir):
+                        for dir_name in dirs:
+                            try:
+                                dir_path = os.path.join(root, dir_name)
+                                os.chmod(dir_path, 0o775)
+                                if effective_uid is not None:
+                                    os.chown(dir_path, effective_uid, effective_gid)
+                            except Exception:
+                                pass
+                        
+                        for file_name in files:
+                            try:
+                                file_path = os.path.join(root, file_name)
+                                os.chmod(file_path, 0o664)
+                                if effective_uid is not None:
+                                    os.chown(file_path, effective_uid, effective_gid)
+                            except Exception:
+                                pass
+                except Exception as e:
+                    self.log(f"Предупреждение: не удалось установить права для директории восстановления: {e}")
+            else:
+                try:
+                    # В Windows устанавливаем максимальные права
+                    os.chmod(output_dir, 0o777)
+                    # Для Windows используем другой метод установки полных прав (если доступно)
+                    try:
+                        import win32security
+                        import ntsecuritycon
+                        import win32con
+                        
+                        self.log("Установка полных прав Windows на директорию восстановления...")
+                        # Пытаемся установить полные права для всех пользователей
+                        # (это сложнее реализовать, поэтому делаем только базовую установку)
+                    except ImportError:
+                        self.log("Модули win32security не найдены, используются стандартные права")
+                        
+                except Exception as e:
+                    self.log(f"Предупреждение при установке прав Windows: {e}")
+                
+            self.log(f"Восстановление завершено. Восстановлено: {recovered_count} файлов/папок.")
         except Exception as e:
-            self.logMessage.emit(f"Ошибка восстановления: {e}")
+            self.log(f"Глобальная ошибка восстановления: {e}")
+            
         self.recoveryFinished.emit()
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -493,6 +771,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.engine.logMessage.connect(self.append_log)
         self.engine.scanFinished.connect(self.update_file_table)
         self.engine.recoveryFinished.connect(self.on_recovery_finished)
+        self.engine.rootWarningNeeded.connect(self.show_root_warning)
         self.fileTable.itemSelectionChanged.connect(self.show_preview)
         self.filterType.currentIndexChanged.connect(self.filter_table)
         self.filterStatus.currentIndexChanged.connect(self.filter_table)
@@ -604,54 +883,233 @@ class MainWindow(QtWidgets.QMainWindow):
         selected_items = self.fileTable.selectedItems()
         if not selected_items:
             return
+        
         row = self.fileTable.currentRow()
+        if row >= len(self.all_files):
+            return
+        
         file = self.all_files[row]
         preview_text = ""
         self.previewLabel.clear()
+        
+        # Отображаем информацию о файле даже если предпросмотр недоступен
+        info_template = (
+            f"Имя: {file['name']}\n"
+            f"Устройство: {self.deviceCombo.currentText()}\n"
+            f"Тип: {file.get('type', 'Неизвестно')}\n"
+            f"Размер: {file.get('size', 0)} байт\n"
+            f"MFT-адрес: {file.get('mft_addr', 'N/A')}\n"
+            f"Статус: {file.get('status', 'N/A')}\n"
+            f"Дата удаления: {file.get('deleted_date', 'N/A')}\n"
+            f"Статус восстановления: {file.get('recovery_status', 'N/A')}\n"
+        )
+        
+        # Получаем данные файла для предпросмотра
+        preview_data = None
         if 'data_offset' in file and self.current_device and os.path.exists(self.current_device):
             try:
                 with open(self.current_device, 'rb') as f:
                     f.seek(file['data_offset'])
-                    preview_data = f.read(1024)
-                if file['name'].lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif')):
-                    image = QtGui.QImage()
-                    if image.loadFromData(preview_data):
-                        pixmap = QtGui.QPixmap.fromImage(image).scaled(200, 200, QtCore.Qt.KeepAspectRatio)
-                        self.previewLabel.setPixmap(pixmap)
-                    else:
-                        preview_text = "Не удалось загрузить изображение."
-                elif file['name'].lower().endswith(('.txt', '.log', '.csv')):
-                    try:
-                        preview_text = preview_data.decode('utf-8')
-                    except Exception:
-                        preview_text = "Не удалось декодировать текст."
-                else:
-                    preview_text = preview_data.hex()
+                    # Ограничиваем размер данных для предпросмотра
+                    read_size = min(1024 * 1024, file.get('size', 1024 * 10))  # Максимум 1 МБ или весь файл
+                    preview_data = f.read(read_size)
             except Exception as e:
-                preview_text = f"Ошибка предпросмотра: {e}"
+                preview_text = f"Ошибка чтения данных: {e}"
+        elif 'mft_addr' in file and file['mft_addr'] and pytsk3 and self.current_device:
+            try:
+                img = pytsk3.Img_Info(self.current_device)
+                fs = pytsk3.FS_Info(img)
+                file_entry = fs.open_meta(file['mft_addr'])
+                read_size = min(1024 * 1024, file.get('size', 0))  # Максимум 1 МБ
+                if read_size > 0:
+                    preview_data = file_entry.read_random(0, read_size)
+            except Exception as e:
+                preview_text = f"Ошибка чтения данных через MFT: {e}"
+        
+        if preview_data:
+            # Определяем тип файла для правильного предпросмотра
+            file_ext = os.path.splitext(file['name'])[1].lower()
+            file_type = file.get('type', '').lower()
+            
+            # Обрабатываем изображения
+            if file_ext in ['.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp', '.tiff'] or file_type in ['png', 'jpg', 'jpeg', 'bmp', 'gif', 'webp', 'tiff']:
+                image = QtGui.QImage()
+                if image.loadFromData(preview_data):
+                    # Масштабируем изображение с сохранением пропорций
+                    pixmap = QtGui.QPixmap.fromImage(image)
+                    label_size = self.previewLabel.size()
+                    scaled_pixmap = pixmap.scaled(
+                        label_size, 
+                        QtCore.Qt.KeepAspectRatio, 
+                        QtCore.Qt.SmoothTransformation
+                    )
+                    self.previewLabel.setPixmap(scaled_pixmap)
+                    preview_text = "Изображение успешно загружено."
+                else:
+                    preview_text = "Невозможно отобразить изображение. Возможно, файл поврежден."
+                    # Отображаем HEX данных изображения
+                    preview_text += f"\n\nHEX данных (первые 100 байт):\n{preview_data[:100].hex()}"
+            
+            # Обрабатываем текстовые файлы
+            elif file_ext in ['.txt', '.log', '.csv', '.xml', '.html', '.htm', '.js', '.css', '.json', '.py', '.c', '.cpp', '.h', '.java'] or file_type in ['txt', 'text']:
+                try:
+                    # Пробуем различные кодировки
+                    encodings = ['utf-8', 'cp1251', 'latin-1', 'ascii']
+                    decoded = False
+                    
+                    for encoding in encodings:
+                        try:
+                            text_content = preview_data.decode(encoding)
+                            # Ограничиваем объем текста для отображения
+                            if len(text_content) > 5000:
+                                text_content = text_content[:5000] + "\n...(текст обрезан)..."
+                            preview_text = f"Текстовое содержимое (кодировка {encoding}):\n\n{text_content}"
+                            decoded = True
+                            break
+                        except UnicodeDecodeError:
+                            continue
+                    
+                    if not decoded:
+                        # Если не удалось декодировать как текст, отображаем в HEX
+                        preview_text = "Не удалось декодировать как текст. Возможно, файл бинарный или использует другую кодировку."
+                        preview_text += f"\n\nHEX данных (первые 200 байт):\n{preview_data[:200].hex()}"
+                except Exception as e:
+                    preview_text = f"Ошибка при обработке текста: {e}"
+            
+            # PDF файлы
+            elif file_ext == '.pdf' or file_type == 'pdf':
+                if preview_data.startswith(b'%PDF'):
+                    preview_text = "PDF документ. Доступна только служебная информация.\n\n"
+                    # Извлекаем некоторую метаинформацию PDF
+                    try:
+                        headers = preview_data[:1000].decode('latin-1', errors='ignore')
+                        preview_text += f"Заголовок:\n{headers[:500]}"
+                    except Exception:
+                        preview_text += "Невозможно извлечь метаданные PDF."
+                else:
+                    preview_text = "Файл не соответствует формату PDF."
+                
+            # Документы Office
+            elif file_ext in ['.docx', '.xlsx', '.pptx', '.doc', '.xls', '.ppt'] or file_type in ['docx', 'xlsx', 'pptx', 'doc', 'xls', 'ppt']:
+                preview_text = f"Документ Microsoft Office {file_ext[1:].upper()}. Предпросмотр недоступен."
+                if preview_data[:4] == b'PK\x03\x04':  # Office XML
+                    preview_text += "\n\nФайл в формате Office Open XML."
+                elif preview_data[:8] == b'\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1':  # OLE
+                    preview_text += "\n\nФайл в формате OLE/Compound Document."
+                preview_text += f"\n\nHEX данных (первые 100 байт):\n{preview_data[:100].hex()}"
+            
+            # Архивы
+            elif file_ext in ['.zip', '.rar', '.7z', '.tar', '.gz'] or file_type in ['zip', 'rar', '7z', 'archive']:
+                preview_text = f"Архив {file_ext[1:].upper()}. Предпросмотр содержимого недоступен."
+                preview_text += f"\n\nHEX данных (первые 100 байт):\n{preview_data[:100].hex()}"
+            
+            # Аудио/видео файлы
+            elif file_ext in ['.mp3', '.wav', '.mp4', '.avi', '.mov', '.mkv'] or file_type in ['mp3', 'wav', 'mp4', 'avi', 'mov', 'audio', 'video']:
+                preview_text = f"Медиафайл {file_ext[1:].upper()}. Предпросмотр недоступен."
+                preview_text += f"\n\nHEX данных (первые 100 байт):\n{preview_data[:100].hex()}"
+            
+            # Исполняемые файлы
+            elif file_ext in ['.exe', '.dll', '.so'] or file_type in ['exe', 'binary']:
+                preview_text = "Исполняемый файл. Предпросмотр недоступен."
+                preview_text += f"\n\nHEX данных (первые 200 байт):\n{preview_data[:200].hex()}"
+                
+                # MZ заголовок для Windows EXE
+                if preview_data[:2] == b'MZ':
+                    preview_text += "\n\nФайл содержит корректный заголовок MZ (Windows EXE/DLL)."
+                    
+                    # Попытаемся извлечь информацию о версии, если есть
+                    try:
+                        version_info = ""
+                        for i in range(len(preview_data) - 8):
+                            if preview_data[i:i+8] == b'VS_VERSION_INFO':
+                                version_info = preview_data[i:i+200].decode('utf-16le', errors='ignore')
+                                break
+                        if version_info:
+                            preview_text += f"\n\nИнформация о версии:\n{version_info}"
+                    except Exception:
+                        pass
+            
+            # Для других неизвестных типов показываем HEX дамп
+            else:
+                preview_text = f"Бинарные данные {file_ext[1:] if file_ext else file_type}. Отображение первых 300 байт в HEX формате:\n\n"
+                
+                # Форматированный HEX дамп с адресами
+                hex_dump = ""
+                for i in range(0, min(300, len(preview_data)), 16):
+                    hex_line = preview_data[i:i+16].hex(' ')
+                    ascii_repr = ''.join([chr(b) if 32 <= b <= 126 else '.' for b in preview_data[i:i+16]])
+                    hex_dump += f"{i:04X}: {hex_line:<48} | {ascii_repr}\n"
+                
+                preview_text += hex_dump
         else:
-            preview_text = "Предпросмотр не доступен"
-        info = (f"Устройство: {self.deviceCombo.currentText()}\n"
-                f"MFT addr: {file.get('mft_addr', 'N/A')}\n"
-                f"Статус: {file['status']}\n"
-                f"Дата удаления: {file['deleted_date']}\n"
-                f"Статус восстановления: {file['recovery_status']}\n\n"
-                f"Предпросмотр:\n{preview_text}")
-        self.infoText.setPlainText(info)
+            preview_text = "Предпросмотр недоступен. Не удалось получить данные файла."
+        
+        # Объединяем информацию о файле и результаты предпросмотра
+        full_info = info_template + "\n\nПредпросмотр:\n" + preview_text
+        self.infoText.setPlainText(full_info)
 
     def recover_selected_files(self):
         selected_rows = set(item.row() for item in self.fileTable.selectedItems())
         if not selected_rows:
             self.append_log("Файлы не выбраны.")
             return
+        
         files_to_recover = [self.all_files[i] for i in selected_rows]
+        
         if not hasattr(self, 'output_dir'):
             self.output_dir = QtWidgets.QFileDialog.getExistingDirectory(self, "Выберите папку")
+        
         if not self.output_dir:
             self.append_log("Папка не выбрана!")
             return
+        
+        # Проверяем права доступа к выбранной директории
+        if not os.access(self.output_dir, os.W_OK):
+            try:
+                # Пытаемся создать тестовый файл для проверки прав
+                test_file = os.path.join(self.output_dir, ".test_write_access")
+                with open(test_file, 'w') as f:
+                    f.write("test")
+                os.remove(test_file)
+            except Exception as e:
+                # Если нет прав на запись, предлагаем выбрать другую директорию
+                self.append_log(f"Ошибка доступа к директории: {e}")
+                msg = QtWidgets.QMessageBox()
+                msg.setIcon(QtWidgets.QMessageBox.Warning)
+                msg.setText("Нет прав доступа")
+                msg.setInformativeText(f"У вас нет прав на запись в директорию {self.output_dir}. Выберите другую директорию.")
+                msg.setWindowTitle("Ошибка доступа")
+                msg.setStandardButtons(QtWidgets.QMessageBox.Ok)
+                msg.exec_()
+                
+                # Запрашиваем новую директорию
+                self.output_dir = QtWidgets.QFileDialog.getExistingDirectory(self, "Выберите папку с правами записи")
+                if not self.output_dir:
+                    self.append_log("Восстановление отменено!")
+                    return
+        
+        # Вычисляем общий размер выбранных файлов
+        total_size = sum(f.get('size', 0) for f in files_to_recover)
+        num_files = len(files_to_recover)
+        
+        # Запрашиваем подтверждение у пользователя
+        confirm_msg = QtWidgets.QMessageBox()
+        confirm_msg.setIcon(QtWidgets.QMessageBox.Question)
+        confirm_msg.setText("Подтверждение восстановления")
+        confirm_msg.setInformativeText(f"Будет восстановлено {num_files} файлов общим размером {total_size/1024/1024:.2f} МБ в директорию:\n{self.output_dir}\n\nПродолжить?")
+        confirm_msg.setWindowTitle("Подтверждение")
+        confirm_msg.setStandardButtons(QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+        confirm_msg.setDefaultButton(QtWidgets.QMessageBox.Yes)
+        
+        if confirm_msg.exec_() != QtWidgets.QMessageBox.Yes:
+            self.append_log("Восстановление отменено пользователем.")
+            return
+        
         self.recoverButton.setEnabled(False)
         device = self.deviceCombo.currentText()
+        
+        # Запускаем восстановление в отдельном потоке
+        self.append_log(f"Начинаем восстановление {num_files} файлов в {self.output_dir}")
         threading.Thread(target=self.engine.recover_files, args=(files_to_recover, self.output_dir, device)).start()
 
     def on_recovery_finished(self):
@@ -660,12 +1118,54 @@ class MainWindow(QtWidgets.QMainWindow):
         self.recoverButton.setEnabled(True)
 
     def append_log(self, message):
+        # Создаем метку времени
         timestamp = time.strftime("[%H:%M:%S]", time.localtime())
-        self.logText.append(f"{timestamp} {message}")
+        log_message = f"{timestamp} {message}"
+        
+        # Используем сигналы Qt для безопасного обновления GUI из других потоков
+        QtCore.QMetaObject.invokeMethod(
+            self.logText, 
+            "append", 
+            QtCore.Qt.QueuedConnection,
+            QtCore.Q_ARG(str, log_message)
+        )
+        
+        # Принудительно обрабатываем события для обновления интерфейса
         QtWidgets.QApplication.processEvents()
 
+    # Добавляем метод отображения предупреждения о root-правах
+    def show_root_warning(self):
+        warning = QtWidgets.QMessageBox(self)
+        warning.setIcon(QtWidgets.QMessageBox.Warning)
+        warning.setWindowTitle("Требуются права администратора")
+        warning.setText("Для доступа к устройству требуются права администратора (root)")
+        warning.setInformativeText("Запустите программу с правами администратора (sudo) для полного доступа к устройству. Иначе восстановление может не сработать или восстановленные файлы будут недоступны для редактирования/удаления.")
+        warning.setStandardButtons(QtWidgets.QMessageBox.Ok)
+        warning.exec_()
+
 def main():
+    # Необходимо для правильной работы multiprocessing в Windows
+    if sys.platform == 'win32':
+        multiprocessing.freeze_support()
+    
+    # Устанавливаем метод запуска новых процессов
+    multiprocessing.set_start_method('spawn', force=True)
+    
     app = QtWidgets.QApplication(sys.argv)
+    
+    # Устанавливаем стиль приложения
+    app.setStyle('Fusion')
+    
+    # Проверяем наличие необходимых библиотек
+    if pytsk3 is None:
+        msg = QtWidgets.QMessageBox()
+        msg.setIcon(QtWidgets.QMessageBox.Warning)
+        msg.setText("Библиотека pytsk3 не установлена")
+        msg.setInformativeText("Некоторые функции восстановления будут недоступны. Рекомендуется установить pytsk3 для полной функциональности.")
+        msg.setWindowTitle("Предупреждение")
+        msg.setStandardButtons(QtWidgets.QMessageBox.Ok)
+        msg.exec_()
+    
     window = MainWindow()
     window.show()
     sys.exit(app.exec_())
